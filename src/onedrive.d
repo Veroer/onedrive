@@ -1,6 +1,14 @@
-import std.net.curl: CurlException, HTTP;
-import std.datetime, std.exception, std.file, std.json, std.path;
-import std.stdio, std.string, std.uni, std.uri;
+import std.algorithm: min;
+import std.conv;
+import std.datetime;
+import std.exception;
+import std.file;
+import std.json;
+import std.path;
+import std.stdio;
+import std.string;
+import std.uri;
+import std.net.curl;
 import config;
 static import log;
 
@@ -14,6 +22,19 @@ private immutable {
 	string itemByIdUrl = "https://graph.microsoft.com/v1.0/me/drive/items/";
 	string itemByPathUrl = "https://graph.microsoft.com/v1.0/me/drive/root:/";
 	string driveByIdUrl = "https://graph.microsoft.com/v1.0/drives/";
+}
+
+version(unittest)
+{
+	private OneDriveApi buildOneDriveApi()
+	{
+		string configDirName = expandTilde("~/.config/onedrive");
+		auto cfg = new config.Config(configDirName);
+		cfg.init();
+		OneDriveApi onedrive = new OneDriveApi(cfg);
+		onedrive.init();
+		return onedrive;
+	}
 }
 
 class OneDriveException: Exception
@@ -75,7 +96,7 @@ final class OneDriveApi
 		write(url, "\n\n", "Enter the response uri: ");
 		readln(response);
 		// match the authorization code
-		auto c = matchFirst(response, r"(?:[\?&]code=)([\w\d-]+)");
+		auto c = matchFirst(response, r"(?:[\?&]code=)([\w\d-.]+)");
 		if (c.empty) {
 			log.log("Invalid uri");
 			return false;
@@ -92,11 +113,36 @@ final class OneDriveApi
 		return get(driveUrl);
 	}
 
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		auto drive = onedrive.getDefaultDrive();
+		assert("id" in drive);
+		assert("quota" in drive);
+	}
+
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_get
 	JSONValue getDefaultRoot()
 	{
 		checkAccessTokenExpired();
 		return get(driveUrl ~ "/root");
+	}
+
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		auto root = onedrive.getDefaultRoot();
+		assert("id" in root);
+		assert("root" in root);
+		assert("folder" in root);
+	}
+
+	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_get
+	JSONValue getItemByPath(const(char)[] path)
+	{
+		checkAccessTokenExpired();
+		const(char)[] url = itemByPathUrl ~ encodeComponent(path);
+		return get(url);
 	}
 
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_delta
@@ -106,19 +152,6 @@ final class OneDriveApi
 		const(char)[] url = deltaLink;
 		if (url == null) {
 			url = driveByIdUrl ~ driveId ~ "/items/" ~ id ~ "/delta";
-			url ~= "?select=id,name,eTag,cTag,deleted,file,folder,root,fileSystemInfo,remoteItem,parentReference";
-		}
-		return get(url);
-	}
-
-	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_delta
-	JSONValue viewChangesByPath(const(char)[] path, const(char)[] deltaLink)
-	{
-		checkAccessTokenExpired();
-		const(char)[] url = deltaLink;
-		if (url == null) {
-			if (path == ".") url = driveUrl ~ "/root/delta";
-			else url = itemByPathUrl ~ encodeComponent(path) ~ ":/delta";
 			url ~= "?select=id,name,eTag,cTag,deleted,file,folder,root,fileSystemInfo,remoteItem,parentReference";
 		}
 		return get(url);
@@ -137,14 +170,33 @@ final class OneDriveApi
 	}
 
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_put_content
-	JSONValue simpleUpload(string localPath, string parentDriveId, string parentId, string filename, const(char)[] eTag = null)
+	JSONValue simpleUpload(string localPath, string driveId, string parentId, string filename, const(char)[] eTag = null)
 	{
 		checkAccessTokenExpired();
-		string url = driveByIdUrl ~ parentDriveId ~ "/items/" ~ parentId ~ ":/" ~ encodeComponent(filename) ~ ":/content";
-		// TODO: investigate why this fails for remote folders
-		//if (eTag) http.addRequestHeader("If-Match", eTag);
-		/*else http.addRequestHeader("If-None-Match", "*");*/
-		return upload(localPath, url);
+		string url = driveByIdUrl ~ driveId ~ "/items/" ~ parentId ~ ":/" ~ encodeComponent(filename) ~ ":/content";
+		if (eTag) http.addRequestHeader("if-match", eTag);
+		return upload(url, localPath);
+	}
+
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		string driveId = onedrive.getDefaultDrive()["id"].str;
+		string rootId = onedrive.getDefaultRoot["id"].str;
+
+		collectException(onedrive.deleteByPath("test"));
+
+		std.file.write("/tmp/test", "test");
+		auto item = onedrive.simpleUpload("/tmp/test", driveId, rootId, "test");
+
+		try {
+			onedrive.simpleUpload("/tmp/test", driveId, rootId, "test", "123");
+		} catch (OneDriveException e) {
+			assert(e.httpStatusCode == 412);
+		}
+		onedrive.simpleUpload("/tmp/test", driveId, rootId, "test", item["eTag"].str);
+
+		collectException(onedrive.deleteByPath("test"));
 	}
 
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_put_content
@@ -153,7 +205,28 @@ final class OneDriveApi
 		checkAccessTokenExpired();
 		string url = driveByIdUrl ~ driveId ~ "/items/" ~ id ~ "/content";
 		if (eTag) http.addRequestHeader("If-Match", eTag);
-		return upload(localPath, url);
+		return upload(url, localPath);
+	}
+
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		string driveId = onedrive.getDefaultDrive()["id"].str;
+		string rootId = onedrive.getDefaultRoot["id"].str;
+
+		collectException(onedrive.deleteByPath("test"));
+
+		std.file.write("/tmp/test", "test");
+		auto item = onedrive.simpleUpload("/tmp/test", driveId, rootId, "test");
+
+		try {
+			onedrive.simpleUploadReplace("/tmp/test", driveId, item["id"].str, "123");
+		} catch (OneDriveException e) {
+			assert(e.httpStatusCode == 412);
+		}
+		onedrive.simpleUploadReplace("/tmp/test", driveId, item["id"].str, item["eTag"].str);
+
+		collectException(onedrive.deleteByPath("test"));
 	}
 
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_update
@@ -171,8 +244,35 @@ final class OneDriveApi
 	{
 		checkAccessTokenExpired();
 		const(char)[] url = driveByIdUrl ~ driveId ~ "/items/" ~ id;
-		//TODO: investigate why this always fail with 412 (Precondition Failed)
-		//if (eTag) http.addRequestHeader("If-Match", eTag);
+		if (eTag) http.addRequestHeader("if-match", eTag);
+		del(url);
+	}
+
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		string driveId = onedrive.getDefaultDrive()["id"].str;
+		string rootId = onedrive.getDefaultRoot["id"].str;
+
+		collectException(onedrive.deleteByPath("test"));
+
+		std.file.write("/tmp/test", "test");
+		auto item = onedrive.simpleUpload("/tmp/test", driveId, rootId, "test");
+
+		try {
+			onedrive.deleteById(driveId, item["id"].str, "123");
+		} catch (OneDriveException e) {
+			assert(e.httpStatusCode == 412);
+		}
+		onedrive.deleteById(driveId, item["id"].str, item["eTag"].str);
+
+		collectException(onedrive.deleteByPath("test"));
+	}
+
+	void deleteByPath(const(char)[] path)
+	{
+		checkAccessTokenExpired();
+		auto url = itemByPathUrl ~ encodeComponent(path);
 		del(url);
 	}
 
@@ -185,6 +285,38 @@ final class OneDriveApi
 		return post(url, item.toString());
 	}
 
+	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_post_children
+	JSONValue createFolder(const(char)[] driveId, const(char)[] parentId, const(char)[] name)
+	{
+		checkAccessTokenExpired();
+		const(char)[] url = driveByIdUrl ~ driveId ~ "/items/" ~ parentId ~ "/children";
+		http.addRequestHeader("Content-Type", "application/json");
+		JSONValue item = [
+			"name": JSONValue(name),
+			"folder": JSONValue(cast(int[string]) null)
+		];
+		return post(url, item.toString());
+	}
+
+	unittest
+	{
+		OneDriveApi onedrive = buildOneDriveApi();
+		string driveId = onedrive.getDefaultDrive()["id"].str;
+		string rootId = onedrive.getDefaultRoot["id"].str;
+
+		collectException(onedrive.deleteByPath("test"));
+
+		onedrive.createFolder(driveId, rootId, "test");
+
+		try {
+			onedrive.createFolder(driveId, rootId, "test");
+		} catch (OneDriveException e) {
+			assert(e.httpStatusCode == 409);
+		}
+
+		collectException(onedrive.deleteByPath("test"));
+	}
+
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_createuploadsession
 	JSONValue createUploadSession(const(char)[] parentDriveId, const(char)[] parentId, const(char)[] filename, const(char)[] eTag = null)
 	{
@@ -195,36 +327,19 @@ final class OneDriveApi
 	}
 
 	// https://dev.onedrive.com/items/upload_large_files.htm
-	JSONValue uploadFragment(const(char)[] uploadUrl, string filepath, long offset, long offsetSize, long fileSize)
+	JSONValue uploadFragment(const(char)[] uploadUrl, string filepath, long offset, long fragmentSize, long fileSize)
 	{
 		checkAccessTokenExpired();
-		scope(exit) {
-			http.clearRequestHeaders();
-			http.onSend = null;
-		}
-		http.method = HTTP.Method.put;
-		http.url = uploadUrl;
-		// when using microsoft graph the auth code is different
-		//addAccessTokenHeader();
-		import std.conv;
-		string contentRange = "bytes " ~ to!string(offset) ~ "-" ~ to!string(offset + offsetSize - 1) ~ "/" ~ to!string(fileSize);
+		string contentRange = "bytes " ~ to!string(offset) ~ "-" ~ to!string(offset + fragmentSize - 1) ~ "/" ~ to!string(fileSize);
 		http.addRequestHeader("Content-Range", contentRange);
-		auto file = File(filepath, "rb");
-		file.seek(offset);
-		http.onSend = data => file.rawRead(data).length;
-		http.contentLength = offsetSize;
-		auto response = perform();
-		// TODO: retry on 5xx errors
-		checkHttpCode();
-		return response;
+		return upload(uploadUrl, filepath, offset, fragmentSize);
 	}
 
 	// https://dev.onedrive.com/items/upload_large_files.htm
 	JSONValue requestUploadStatus(const(char)[] uploadUrl)
 	{
 		checkAccessTokenExpired();
-		// when using microsoft graph the auth code is different
-		return get(uploadUrl, true);
+		return get(uploadUrl);
 	}
 
 	private void redeemToken(const(char)[] authCode)
@@ -276,120 +391,126 @@ final class OneDriveApi
 		http.addRequestHeader("Authorization", accessToken);
 	}
 
-	private JSONValue get(const(char)[] url, bool skipToken = false)
+	private JSONValue get(const(char)[] url)
 	{
-		scope(exit) http.clearRequestHeaders();
 		http.method = HTTP.Method.get;
 		http.url = url;
-		if (!skipToken) addAccessTokenHeader(); // HACK: requestUploadStatus
-		auto response = perform();
-		checkHttpCode(response);
-		return response;
+		return perform();
 	}
 
 	private void del(const(char)[] url)
 	{
-		scope(exit) http.clearRequestHeaders();
 		http.method = HTTP.Method.del;
 		http.url = url;
-		addAccessTokenHeader();
-		auto response = perform();
-		checkHttpCode(response);
+		perform();
 	}
 
-	private void download(const(char)[] url, string filename)
+	private void download(const(char)[] url, string outfile)
 	{
-		scope(exit) http.clearRequestHeaders();
 		http.method = HTTP.Method.get;
 		http.url = url;
-		addAccessTokenHeader();
-		auto f = File(filename, "wb");
-		http.onReceive = (ubyte[] data) {
-			f.rawWrite(data);
-			return data.length;
-		};
-		http.perform();
-		checkHttpCode();
+		perform(outfile);
 	}
 
-	private auto patch(T)(const(char)[] url, const(T)[] patchData)
+	private auto patch(const(char)[] url, const(void)[] patchData)
 	{
-		scope(exit) http.clearRequestHeaders();
 		http.method = HTTP.Method.patch;
 		http.url = url;
-		addAccessTokenHeader();
-		auto response = perform(patchData);
-		checkHttpCode(response);
-		return response;
+		setContent(patchData);
+		return perform();
 	}
 
-	private auto post(T)(const(char)[] url, const(T)[] postData)
+	private auto post(const(char)[] url, const(void)[] postData)
 	{
-		scope(exit) http.clearRequestHeaders();
 		http.method = HTTP.Method.post;
 		http.url = url;
-		addAccessTokenHeader();
-		auto response = perform(postData);
-		checkHttpCode(response);
-		return response;
+		setContent(postData);
+		return perform();
 	}
 
-	private JSONValue upload(string filepath, string url)
+	private JSONValue upload(const(char)[] url, string filepath, long offset = 0, long contentLength = 0)
 	{
-		scope(exit) {
-			http.clearRequestHeaders();
-			http.onSend = null;
-			http.contentLength = 0;
-		}
 		http.method = HTTP.Method.put;
 		http.url = url;
-		addAccessTokenHeader();
 		http.addRequestHeader("Content-Type", "application/octet-stream");
 		auto file = File(filepath, "rb");
+		file.seek(offset);
 		http.onSend = data => file.rawRead(data).length;
-		http.contentLength = file.size;
-		auto response = perform();
-		checkHttpCode(response);
-		return response;
+		http.contentLength = contentLength <= 0 ? file.size : contentLength;
+		return perform();
 	}
 
-	private JSONValue perform(const(void)[] sendData)
+	private void setContent(const(void)[] data)
 	{
-		scope(exit) {
-			http.onSend = null;
-			http.contentLength = 0;
-		}
-		if (sendData) {
-			http.contentLength = sendData.length;
-			http.onSend = (void[] buf) {
-				import std.algorithm: min;
-				size_t minLen = min(buf.length, sendData.length);
-				if (minLen == 0) return 0;
-				buf[0 .. minLen] = sendData[0 .. minLen];
-				sendData = sendData[minLen .. $];
-				return minLen;
-			};
-		} else {
-			http.onSend = buf => 0;
-		}
-		return perform();
+		http.contentLength = data.length;
+		http.onSend = (void[] buf) {
+			auto length = min(buf.length, data.length);
+			buf[0 .. length] = data[0 .. length];
+			data = data[length .. $];
+			return length;
+		};
 	}
 
 	private JSONValue perform()
 	{
-		scope(exit) http.onReceive = null;
+		scope(exit) {
+			http.contentLength = 0;
+			http.onReceive = null;
+			http.onSend = null;
+			http.clearRequestHeaders();
+		}
+		scope(failure) {
+			http = HTTP();
+		}
+
+		addAccessTokenHeader();
+
 		char[] content;
 		http.onReceive = (ubyte[] data) {
 			content ~= data;
 			return data.length;
 		};
+
 		http.perform();
+
+		auto json = parseJson(content);
+		checkHttpCode(json);
+
+		return json;
+	}
+
+	private void perform(string outfile)
+	{
+		scope(exit) {
+			http.contentLength = 0;
+			http.onReceive = null;
+			http.onSend = null;
+			http.clearRequestHeaders();
+		}
+		scope(failure) {
+			http = HTTP();
+		}
+
+		addAccessTokenHeader();
+
+		auto f = File(outfile, "wb");
+		http.onReceive = (ubyte[] data) {
+			f.rawWrite(data);
+			return data.length;
+		};
+
+		http.perform();
+		checkHttpCode();
+	}
+
+	private JSONValue parseJson(const(char)[] str)
+	{
 		JSONValue json;
 		try {
-			json = content.parseJSON();
+			json = parseJSON(str);
 		} catch (JSONException e) {
 			e.msg ~= "\n";
-			e.msg ~= content;
+			e.msg ~= str;
 			throw e;
 		}
 		return json;
@@ -408,38 +529,4 @@ final class OneDriveApi
 			throw new OneDriveException(http.statusLine.code, http.statusLine.reason, response);
 		}
 	}
-}
-
-unittest
-{
-	string configDirName = expandTilde("~/.config/onedrive");
-	auto cfg = new config.Config(configDirName);
-	cfg.init();
-	OneDriveApi onedrive = new OneDriveApi(cfg);
-	onedrive.init();
-	std.file.write("/tmp/test", "test");
-
-	// simpleUpload
-	auto item = onedrive.simpleUpload("/tmp/test", "/test");
-	try {
-		item = onedrive.simpleUpload("/tmp/test", "/test");
-	} catch (OneDriveException e) {
-		assert(e.httpStatusCode == 409);
-	}
-	try {
-		item = onedrive.simpleUpload("/tmp/test", "/test", "123");
-	} catch (OneDriveException e) {
-		assert(e.httpStatusCode == 412);
-	}
-	item = onedrive.simpleUpload("/tmp/test", "/test", item["eTag"].str);
-
-	// deleteById
-	try {
-		onedrive.deleteById(item["id"].str, "123");
-	} catch (OneDriveException e) {
-		assert(e.httpStatusCode == 412);
-	}
-	onedrive.deleteById(item["id"].str, item["eTag"].str);
-
-	onedrive.http.shutdown();
 }

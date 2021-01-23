@@ -9,6 +9,11 @@ bool downloadOnly;
 
 int main(string[] args)
 {
+	version(unittest)
+	{
+		return 0;
+	}
+	
 	// configuration directory
 	string configDirName = environment.get("XDG_CONFIG_HOME", "~/.config") ~ "/onedrive";
 	// override the sync directory
@@ -125,6 +130,7 @@ int main(string[] args)
 		Monitor m = new Monitor(selectiveSync);
 		m.onDirCreated = delegate(string path) {
 			log.vlog("[M] Directory created: ", path);
+			if (!online) return;
 			try {
 				sync.scanForDifferences(path);
 			} catch(Exception e) {
@@ -133,6 +139,7 @@ int main(string[] args)
 		};
 		m.onFileChanged = delegate(string path) {
 			log.vlog("[M] File changed: ", path);
+			if (!online) return;
 			try {
 				sync.scanForDifferences(path);
 			} catch(Exception e) {
@@ -141,6 +148,7 @@ int main(string[] args)
 		};
 		m.onDelete = delegate(string path) {
 			log.vlog("[M] Item deleted: ", path);
+			if (!online) return;
 			try {
 				sync.deleteByPath(path);
 			} catch(Exception e) {
@@ -148,6 +156,7 @@ int main(string[] args)
 			}
 		};
 		m.onMove = delegate(string from, string to) {
+			if (!online) return;
 			log.vlog("[M] Item moved: ", from, " -> ", to);
 			try {
 				sync.uploadMoveItem(from, to);
@@ -157,7 +166,7 @@ int main(string[] args)
 		};
 		if (!downloadOnly) m.init(cfg);
 		// monitor loop
-		immutable auto checkInterval = dur!"seconds"(45);
+		immutable auto checkInterval = dur!"seconds"(300);
 		auto lastCheckTime = MonoTime.currTime();
 		while (true) {
 			if (!downloadOnly) m.update(online);
@@ -174,7 +183,7 @@ int main(string[] args)
 				}
 				GC.collect();
 			}
-			Thread.sleep(dur!"msecs"(500));
+			Thread.sleep(dur!"seconds"(1));
 		}
 	}
 

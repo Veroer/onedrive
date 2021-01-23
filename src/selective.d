@@ -22,6 +22,11 @@ final class SelectiveSync
 		}
 	}
 
+	void addPath(string path)
+	{
+		paths ~= buildNormalizedPath(path);
+	}
+
 	void setMask(const(char)[] mask)
 	{
 		this.mask = wild2regex(mask);
@@ -29,7 +34,10 @@ final class SelectiveSync
 
 	bool isNameExcluded(string name)
 	{
-		return !name.matchFirst(mask).empty;
+		// always allow the root
+		if (name == ".") return false;
+		
+		return !mask.empty && !name.matchFirst(mask).empty;
 	}
 
 	bool isPathExcluded(string path)
